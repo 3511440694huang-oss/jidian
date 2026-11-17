@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">疾点</string>
+    <string name="tile_label">疾点连点</string>
+    <string name="accessibility_description">疾点通过无障碍服务，在你指定的位置执行点击、双击、长按与滑动手势。服务只在你按下启动后派发手势，不读取屏幕内容、不采集任何数据。可在无障碍设置里随时关闭。</string>
+    <string name="notification_channel_name">连点控制台</string>
+    <string name="notification_channel_desc">悬浮控制台与连点运行状态</string>
+    <string name="notification_title">疾点运行中</string>
+    <string name="notification_text">悬浮控制台就绪</string>
+    <string name="notification_action_stop">停止连点</string>
+    <string name="notification_action_open">打开疾点</string>
+</resources>

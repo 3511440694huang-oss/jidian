@@ -1,0 +1,13 @@
+.gradle/
+build/
+app/build/
+local.properties
+keystore/
+APK/*.apk
+*.log
+.kotlin/
+.idea/
+icon-art.png
+icon-flat-2048.png
+generated-images/
+*.keystore

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 疾点调色板：钢制计时码表 -->
+    <color name="jd_panel">#F7F5F0</color>
+    <color name="jd_ivory">#EDEAE3</color>
+    <color name="jd_graphite">#14171A</color>
+    <color name="jd_steel">#6E777D</color>
+    <color name="jd_hairline">#D3D2CB</color>
+    <color name="jd_signal">#C6372A</color>
+    <color name="jd_brass">#A8792C</color>
+    <color name="jd_icon_bg">#14171A</color>
+</resources>
