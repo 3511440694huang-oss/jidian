@@ -31,7 +31,7 @@ import app.jidian.tap.overlay.RegionPickerView
 import app.jidian.tap.util.Notifications
 
 /**
- * 悬浮窗前台服务：承载 64dp 控制圆盘、展开面板与全屏框选层。
+ * 悬浮窗前台服务：承载 52dp 控制圆盘、展开面板与全屏框选层。
  *
  * - 前台通知（specialUse 类型）常驻，带「停止连点」「打开疾点」两个 action；
  * - 三个 overlay 窗口分别独立挂到 WindowManager（不塞进同一个窗口做复杂布局）：
@@ -55,6 +55,9 @@ class FloatService : Service() {
 
     private var sampling = false
     private var lastEngineRunning = false
+    private var pendingDx = 0
+    private var pendingDy = 0
+    private var dragFlushScheduled = false
 
     // ------------------------------------------------------------------ 生命周期
 
@@ -81,6 +84,16 @@ class FloatService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
+
+        // 「停止」必须先于悬浮窗权限检查执行：
+        // 用户没给悬浮窗权限时，通知栏的停止 action 是唯一的外部停止入口，
+        // 不能被「没有悬浮窗权限 → 直接 end service」的守卫顺手拦掉。
+        if (action == ACTION_STOP_ENGINE) {
+            stopEngineFromNotification()
+            if (podView == null) stopSelf()
+            return Service.START_NOT_STICKY
+        }
+
         if (!Settings.canDrawOverlays(this)) {
             // 权限被撤销：不叠加任何窗口
             notifyOverlayMissing()
@@ -102,8 +115,6 @@ class FloatService : Service() {
                 collapsePanel()
                 enterPicker()
             }
-
-            ACTION_STOP_ENGINE -> stopEngineFromNotification()
 
             else -> {
                 // ACTION_SHOW，或系统重启后的空 intent：确保圆盘在
@@ -179,10 +190,11 @@ class FloatService : Service() {
         mainHandler.removeCallbacks(sampleRunnable)
     }
 
-    /** 100ms 采样一次引擎状态：圆盘自己比较变化，没变不重绘。 */
+    /** 250ms 采样一次引擎状态：圆盘/面板自己比较变化，没变不重绘。 */
     private fun sampleEngine() {
         val status = runCatching { JidianApp.from(this).engine.status.value }.getOrNull() ?: return
-        podView?.applyEngineState(status.running, status.sessionTaps)
+        podView?.applyEngineState(status.running)
+        panelView?.setRunning(status.running)
         if (status.running != lastEngineRunning) {
             lastEngineRunning = status.running
             updateNotification(status.running)
@@ -204,7 +216,7 @@ class FloatService : Service() {
 
         val view = ControlPodView(this)
         view.listener = podListener
-        val size = dp(64f)
+        val size = dp(POD_SIZE_DP)
         val params = newOverlayParams(
             size,
             size,
@@ -224,7 +236,7 @@ class FloatService : Service() {
         // 首帧前先同步一次状态，避免闪一下待命三角
         runCatching { JidianApp.from(this).engine.status.value }
             .getOrNull()
-            ?.let { view.applyEngineState(it.running, it.sessionTaps) }
+            ?.let { view.applyEngineState(it.running) }
         return true
     }
 
@@ -240,17 +252,13 @@ class FloatService : Service() {
     }
 
     private fun clampPodParams(params: WindowManager.LayoutParams) {
-        val size = dp(64f)
+        val size = dp(POD_SIZE_DP)
         params.x = params.x.coerceIn(0, (screenWidth() - size).coerceAtLeast(0))
         params.y = params.y.coerceIn(0, (screenHeight() - size).coerceAtLeast(0))
     }
 
     private val podListener = object : ControlPodView.Listener {
         override fun onToggle() {
-            if (panelView != null) {
-                collapsePanel()
-                return
-            }
             toggleEngine()
         }
 
@@ -262,30 +270,51 @@ class FloatService : Service() {
             }
         }
 
-        override fun onOpenApp() {
-            collapsePanel()
-            launchMain()
-        }
-
         override fun onDragBy(dx: Int, dy: Int) {
-            val view = podView ?: return
-            val params = podParams ?: return
-            params.x += dx
-            params.y += dy
-            try {
-                windowManager.updateViewLayout(view, params)
-            } catch (_: Throwable) {
-                // 窗口可能正在被系统移除，忽略
+            // 触摸事件比屏幕刷新快：先把位移攒起来，每帧只 updateViewLayout 一次，
+            // 避免每个 MOVE 都走一次 WindowManager IPC 造成拖拽发涩。
+            pendingDx += dx
+            pendingDy += dy
+            if (!dragFlushScheduled) {
+                dragFlushScheduled = true
+                mainHandler.post(dragFlushRunnable)
             }
         }
 
         override fun onDragFinished() {
+            mainHandler.removeCallbacks(dragFlushRunnable)
+            dragFlushScheduled = false
+            flushDrag()
             val params = podParams ?: return
             applyPodClamp()
             overlayPrefs.edit()
                 .putInt(KEY_POD_X, params.x)
                 .putInt(KEY_POD_Y, params.y)
                 .apply()
+        }
+    }
+
+    private val dragFlushRunnable = Runnable {
+        dragFlushScheduled = false
+        flushDrag()
+    }
+
+    private fun flushDrag() {
+        if (pendingDx == 0 && pendingDy == 0) return
+        val view = podView ?: run {
+            pendingDx = 0
+            pendingDy = 0
+            return
+        }
+        val params = podParams ?: return
+        params.x += pendingDx
+        params.y += pendingDy
+        pendingDx = 0
+        pendingDy = 0
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (_: Throwable) {
+            // 窗口可能正在被系统移除，忽略
         }
     }
 
@@ -327,8 +356,8 @@ class FloatService : Service() {
     private fun addPanelWindow(): Boolean {
         if (panelView != null) return true
         val podWin = podParams ?: return false
-        val panelWidth = dp(240f)
-        val panelHeight = dp(96f)
+        val panelWidth = dp(OverlayPanelView.PANEL_WIDTH_DP)
+        val panelHeight = dp(OverlayPanelView.PANEL_HEIGHT_DP)
         val view = OverlayPanelView(this)
         view.listener = panelListener
         val params = newOverlayParams(
@@ -338,7 +367,7 @@ class FloatService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
         )
-        val podSize = dp(64f)
+        val podSize = dp(POD_SIZE_DP)
         val gap = dp(8f)
         var panelX = podWin.x + podSize / 2 - panelWidth / 2
         var panelY = podWin.y - panelHeight - gap
@@ -376,6 +405,12 @@ class FloatService : Service() {
         override fun onOpenApp() {
             collapsePanel()
             launchMain()
+        }
+
+        override fun onToggle() {
+            toggleEngine()
+            // 启停是「一次性的决定」：按完就收起面板，别让全屏 scrim 继续挡着目标 App
+            collapsePanel()
         }
     }
 
@@ -451,8 +486,16 @@ class FloatService : Service() {
             .onFailure { JidianLog.error(TAG, "切换连点失败：${it.message}") }
         val runningNow = runCatching { JidianApp.from(this).engine.isRunning }.getOrDefault(false)
         when {
-            runningNow -> JidianLog.info(TAG, "悬浮窗启动连点")
-            wasRunning -> JidianLog.info(TAG, "悬浮窗停止连点")
+            runningNow -> {
+                JidianLog.info(TAG, "悬浮窗启动连点")
+                showToast("已开始 · 轻点圆盘停止")
+            }
+
+            wasRunning -> {
+                JidianLog.info(TAG, "悬浮窗停止连点")
+                showToast("已停止")
+            }
+
             else -> {
                 JidianLog.warn(TAG, "连点启动失败：无障碍服务未就绪")
                 showToast("无障碍服务未开启")
@@ -591,8 +634,11 @@ class FloatService : Service() {
         const val ACTION_STOP_ENGINE = "app.jidian.tap.action.STOP_ENGINE"
 
         private const val TAG = "FloatService"
-        private const val SAMPLE_INTERVAL_MS = 100L
+        private const val SAMPLE_INTERVAL_MS = 250L
         private const val CONFIG_RECLAMP_DELAY_MS = 350L
+        /** 圆盘窗口边长（dp）。视觉圆盘比窗口再小一圈，见 ControlPodView。 */
+        private const val POD_SIZE_DP = 52f
+
         private const val OVERLAY_PREFS = "jidian_overlay"
         private const val KEY_POD_X = "x"
         private const val KEY_POD_Y = "y"

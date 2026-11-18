@@ -12,6 +12,9 @@ enum class RegionShape { CIRCLE, RECT }
  * 坐标系说明：region/overlay 坐标均为**屏幕绝对像素**（含状态栏的整块显示区域），
  * 与 AccessibilityService.dispatchGesture 使用的坐标系一致。
  * regionCx/regionCy 为 -1 表示尚未框选，引擎按当前屏幕中心运行。
+ *
+ * 节奏下限放到 1ms：给人「极限速度」的上限入口，实际能跑多快由系统的
+ * accessibility 手势注入能力决定，界面上的「实际频率」显示的是实测值。
  */
 data class ClickConfig(
     val intervalMs: Long = 120L,
@@ -39,12 +42,21 @@ data class ClickConfig(
     val targetCps: Float
         get() = if (intervalMs <= 0L) 0f else 1000f / intervalMs.toFloat()
 
+    /** 是否为「极限节奏」：间隔已经短到由系统注入速度决定。 */
+    val ultraFast: Boolean
+        get() = intervalMs <= ULTRA_FAST_THRESHOLD_MS
+
     /** 引擎热路径读取的安全版本：所有数值已收敛到合法区间。 */
     fun safe(): ClickConfig = sanitized(this)
 
     companion object {
-        const val MIN_INTERVAL_MS = 10L
+        /** 节奏下限 1ms（上限 1000 次/秒的输入目标，实测由系统决定）。 */
+        const val MIN_INTERVAL_MS = 1L
         const val MAX_INTERVAL_MS = 10_000L
+
+        /** ≤ 该值视为极限节奏：触点时长压到 1ms，不再塞随机触点时长。 */
+        const val ULTRA_FAST_THRESHOLD_MS = 16L
+
         const val MIN_DOUBLE_GAP_MS = 20L
         const val MAX_DOUBLE_GAP_MS = 400L
         const val MIN_SWIPE_MS = 60L
@@ -58,8 +70,20 @@ data class ClickConfig(
         const val MAX_REGION_SIDE = 4_000
         const val MAX_LIMIT_COUNT = 1_000_000
 
-        /** 节奏预设（毫秒） */
-        val INTERVAL_PRESETS = listOf(20L, 50L, 100L, 200L, 500L, 1_000L)
+        /** 主界面快捷档位（毫秒）：1ms 起，覆盖「极限」到「慢速」。 */
+        val INTERVAL_PRESETS = listOf(1L, 10L, 50L, 100L, 500L, 1_000L)
+
+        /**
+         * 面板 [−][+] 的步进阶梯（毫秒）。
+         *
+         * 低端按 1/2/5/10… 递增，保证从 1ms 也能一档一档往上走；
+         * 超过 1000ms 后按 500ms 粗调，最长 10000ms。
+         */
+        val INTERVAL_LADDER = listOf(
+            1L, 2L, 5L, 10L, 15L, 20L, 30L, 40L, 50L, 75L,
+            100L, 150L, 200L, 300L, 500L, 750L, 1_000L,
+            1_500L, 2_000L, 3_000L, 5_000L, 10_000L,
+        )
 
         val Default = ClickConfig()
 

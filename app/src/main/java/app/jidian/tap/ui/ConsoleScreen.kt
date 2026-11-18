@@ -3,6 +3,7 @@ package app.jidian.tap.ui
 import android.Manifest
 import android.os.Build
 import android.os.SystemClock
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
@@ -33,6 +34,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -46,10 +50,14 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -93,7 +101,10 @@ import app.jidian.tap.ui.theme.JdType
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -189,7 +200,16 @@ fun ConsoleScreen() {
                 JdPermission.openAccessibility(context)
             } else {
                 val started = app.engine.start("user")
-                if (!started) {
+                if (started) {
+                    // 连点是在后台跨应用跑的，必须有一个随手能停的入口：
+                    // 有悬浮窗权限就把控制圆盘拉起来（没权限时靠通知栏 action 兜底）。
+                    if (permissions.overlay && !FloatService.isRunning) {
+                        runCatching { FloatService.show(context) }
+                            .onFailure { JidianLog.warn("UI", "拉起悬浮控制台失败：${it.message}") }
+                    }
+                    val hint = if (permissions.overlay) "已开始 · 轻点悬浮圆盘停止" else "已开始 · 可在通知栏停止"
+                    Toast.makeText(context, hint, Toast.LENGTH_SHORT).show()
+                } else {
                     permissions = JdPermission.read(context)
                     JidianLog.warn("UI", "引擎未进入运行态")
                 }
@@ -565,7 +585,13 @@ private fun RhythmSection(
         JdSectionHeader(title = "节奏", hint = "两次点击之间的间隔")
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.Bottom) {
-            Text(config.intervalMs.toString(), style = JdType.monoXL, color = JdGraphite)
+            // 读数本身就是输入框：点一下就能直接敲想要的毫秒数，不用来回拖滑杆
+            JdIntervalField(
+                interval = config.intervalMs,
+                onCommit = { ms ->
+                    if (ms != config.intervalMs) update { it.copy(intervalMs = ms) }
+                },
+            )
             Spacer(Modifier.width(4.dp))
             Text(
                 text = "ms",
@@ -583,11 +609,12 @@ private fun RhythmSection(
             )
         }
         Spacer(Modifier.height(2.dp))
+        // 对数滑杆：1ms–10000ms 均匀铺开，低端（极速）也点得准
         JdSlider(
-            value = config.intervalMs.toFloat(),
-            valueRange = 20f..2000f,
-            onValueChange = { next ->
-                val interval = next.roundToInt().toLong()
+            value = intervalToFraction(config.intervalMs),
+            valueRange = 0f..1f,
+            onValueChange = { fraction ->
+                val interval = fractionToInterval(fraction)
                 if (interval != config.intervalMs) {
                     update { it.copy(intervalMs = interval) }
                 }
@@ -607,7 +634,68 @@ private fun RhythmSection(
                 )
             }
         }
+        Spacer(Modifier.height(8.dp))
+        JdNote(
+            text = "可输入 1–10000 ms。1–16 ms 是极限档：能跑多快取决于机型的手势注入上限，" +
+                "以顶部「实际频率」为准",
+        )
     }
+}
+
+/** 毫秒 → 对数滑杆位置（0=1ms，1=10000ms）。 */
+private fun intervalToFraction(ms: Long): Float {
+    val min = ClickConfig.MIN_INTERVAL_MS.toDouble()
+    val max = ClickConfig.MAX_INTERVAL_MS.toDouble()
+    val value = ms.toDouble().coerceIn(min, max)
+    return ((ln(value) - ln(min)) / (ln(max) - ln(min))).toFloat()
+}
+
+/** 对数滑杆位置 → 毫秒。 */
+private fun fractionToInterval(fraction: Float): Long {
+    val min = ClickConfig.MIN_INTERVAL_MS.toDouble()
+    val max = ClickConfig.MAX_INTERVAL_MS.toDouble()
+    val value = exp(ln(min) + (ln(max) - ln(min)) * fraction.coerceIn(0f, 1f).toDouble())
+    return value.roundToLong().coerceIn(ClickConfig.MIN_INTERVAL_MS, ClickConfig.MAX_INTERVAL_MS)
+}
+
+/**
+ * 可编辑的间隔读数：外观是 Mono 大号数字，点进去是数字键盘。
+ * 提交时机：键盘 Done 或失焦；非法/越界输入自动收敛回合法区间。
+ */
+@Composable
+private fun JdIntervalField(interval: Long, onCommit: (Long) -> Unit) {
+    var text by remember(interval) { mutableStateOf(interval.toString()) }
+    var focused by remember { mutableStateOf(false) }
+
+    fun commit() {
+        val parsed = text.toLongOrNull()
+        if (parsed == null) {
+            text = interval.toString()
+            return
+        }
+        val value = parsed.coerceIn(ClickConfig.MIN_INTERVAL_MS, ClickConfig.MAX_INTERVAL_MS)
+        text = value.toString()
+        if (value != interval) onCommit(value)
+    }
+
+    BasicTextField(
+        value = text,
+        onValueChange = { raw -> text = raw.filter { it.isDigit() }.take(5) },
+        textStyle = JdType.monoXL.copy(color = JdGraphite),
+        singleLine = true,
+        cursorBrush = SolidColor(JdGraphite),
+        keyboardOptions = KeyboardOptions(
+            keyboardType = KeyboardType.Number,
+            imeAction = ImeAction.Done,
+        ),
+        keyboardActions = KeyboardActions(onDone = { commit() }),
+        modifier = Modifier
+            .widthIn(min = 48.dp)
+            .onFocusChanged { state ->
+                if (focused && !state.isFocused) commit()
+                focused = state.isFocused
+            },
+    )
 }
 
 // —— 动作 ——

@@ -392,13 +392,13 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
             when (cfg.mode) {
                 TapMode.SINGLE -> {
                     val p = Geometry.samplePoint(cfg, w, h, random)
-                    builder.addStroke(pointStroke(p, 0L, tapDurationMs(), w, h))
+                    builder.addStroke(pointStroke(p, 0L, tapDurationMs(cfg), w, h))
                 }
 
                 TapMode.DOUBLE -> {
                     // 双击的关键：两个 Stroke 放进同一个 GestureDescription，只走一次 IPC
                     val p = Geometry.samplePoint(cfg, w, h, random)
-                    val tapMs = tapDurationMs()
+                    val tapMs = tapDurationMs(cfg)
                     builder.addStroke(pointStroke(p, 0L, tapMs, w, h))
                     builder.addStroke(pointStroke(p, cfg.doubleGapMs, tapMs, w, h))
                 }
@@ -457,14 +457,20 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
         return GestureDescription.StrokeDescription(path, 0L, durationMs.coerceAtLeast(1L))
     }
 
-    /** 1–8ms 的触点时长：短到只被当作一次点击，又留一点随机性降低特征。 */
-    private fun tapDurationMs(): Long =
-        TAP_DURATION_MIN_MS +
+    /**
+     * 触点时长：常规 1–8ms（短到只被当作一次点击，又留一点随机性降低特征）。
+     *
+     * 极限节奏（间隔 ≤ [ClickConfig.ULTRA_FAST_THRESHOLD_MS]）压到 1ms：
+     * 触点时长不能超过节奏本身，否则回调链根本追不上目标间隔。
+     */
+    private fun tapDurationMs(cfg: ClickConfig): Long =
+        if (cfg.ultraFast) TAP_DURATION_MIN_MS
+        else TAP_DURATION_MIN_MS +
             random.nextInt((TAP_DURATION_MAX_MS - TAP_DURATION_MIN_MS + 1).toInt()).toLong()
 
     private fun gestureDurationMs(cfg: ClickConfig): Long = when (cfg.mode) {
-        TapMode.SINGLE -> TAP_DURATION_MAX_MS
-        TapMode.DOUBLE -> cfg.doubleGapMs + TAP_DURATION_MAX_MS
+        TapMode.SINGLE -> if (cfg.ultraFast) TAP_DURATION_MIN_MS else TAP_DURATION_MAX_MS
+        TapMode.DOUBLE -> cfg.doubleGapMs + tapDurationMs(cfg)
         TapMode.LONG_PRESS -> cfg.longPressMs
         TapMode.SWIPE -> cfg.swipeDurationMs
     }

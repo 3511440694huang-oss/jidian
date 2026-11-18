@@ -21,16 +21,17 @@ private val PANEL_IVORY = Color.parseColor("#EDEAE3")
 private val PANEL_GRAPHITE = Color.parseColor("#14171A")
 private val PANEL_STEEL = Color.parseColor("#6E777D")
 private val PANEL_HAIRLINE = Color.parseColor("#D3D2CB")
+private val PANEL_SIGNAL = Color.parseColor("#C6372A")
 
 /**
- * 展开态迷你面板（240×96dp，独立 overlay 窗口）：象牙底 + 石墨 1dp 描边。
+ * 展开态迷你面板（212×132dp，独立 overlay 窗口）：象牙底 + 石墨 1dp 描边。
  *
- * 第一行「间隔」Mono 读数 + [−][+]（步进到 20/50/100/200/500/1000 的相邻档，
- * 超出预设范围退化到 ±10ms）；第二行「模式」当前模式中文名 + [切换]
- * （单击 → 双击 → 长按 → 滑动 循环）；底部「框选落点」「打开疾点」两个文字按钮。
- *
- * 配置读写全部走 [ConfigStore]（[JidianApp.from]），视图自身订阅配置变化，
- * 面板上的操作与主界面读写的是同一份数据。
+ * 四行，全部是「主界面同一份配置」的快捷操作：
+ * 1. 间隔 Mono 读数 + [−][+]（按 [ClickConfig.INTERVAL_LADDER] 步进，1ms 起）；
+ * 2. 模式中文名 + [切换]（单击 → 双击 → 长按 → 滑动 循环）；
+ * 3. 「框选落点」「打开疾点」两个文字按钮；
+ * 4. **通栏启停键**：运行中为信号红「停止」，待命为石墨「启动」。
+ *    这是停止连点的主要入口——面板打开时圆盘被 scrim 盖住，按钮必须自己能用。
  */
 class OverlayPanelView(context: Context) : View(context) {
 
@@ -40,12 +41,16 @@ class OverlayPanelView(context: Context) : View(context) {
 
         /** 点「打开疾点」：宿主收起面板并打开主界面。 */
         fun onOpenApp()
+
+        /** 点通栏启停键：宿主切换引擎启停。 */
+        fun onToggle()
     }
 
     var listener: Listener? = null
 
     private var shownInterval: Long = ClickConfig.Default.intervalMs
     private var shownMode: TapMode = ClickConfig.Default.mode
+    private var engineRunning = false
 
     private var store: ConfigStore? = null
 
@@ -74,12 +79,12 @@ class OverlayPanelView(context: Context) : View(context) {
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = barlowTypeface
-        textSize = sp(12f)
+        textSize = sp(11f)
         color = PANEL_STEEL
     }
     private val readoutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = monoTypeface
-        textSize = sp(16f)
+        textSize = sp(15f)
         color = PANEL_GRAPHITE
     }
     private val modePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -92,23 +97,24 @@ class OverlayPanelView(context: Context) : View(context) {
         textSize = sp(12f)
         color = PANEL_GRAPHITE
     }
-    private val buttonTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val toggleTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = barlowTypeface
         textSize = sp(14f)
-        color = PANEL_GRAPHITE
+        color = PANEL_IVORY
     }
 
     private val labelFm = Paint.FontMetrics()
     private val readoutFm = Paint.FontMetrics()
     private val modeFm = Paint.FontMetrics()
     private val cellFm = Paint.FontMetrics()
-    private val buttonFm = Paint.FontMetrics()
+    private val toggleFm = Paint.FontMetrics()
 
     private val rectMinus = RectF()
     private val rectPlus = RectF()
     private val rectMode = RectF()
     private val rectPick = RectF()
     private val rectOpen = RectF()
+    private val rectToggle = RectF()
     private val tmpRect = RectF()
 
     private var padX = 0f
@@ -121,7 +127,8 @@ class OverlayPanelView(context: Context) : View(context) {
     private var baselineRow2Label = 0f
     private var baselineRow2Mode = 0f
     private var baselineRow2Button = 0f
-    private var baselineBottom = 0f
+    private var baselineRow3 = 0f
+    private var baselineToggle = 0f
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
@@ -139,32 +146,42 @@ class OverlayPanelView(context: Context) : View(context) {
         super.onDetachedFromWindow()
     }
 
+    /** 宿主采样入口：运行状态变化只影响启停键的文案/颜色。 */
+    fun setRunning(running: Boolean) {
+        if (running == engineRunning) return
+        engineRunning = running
+        invalidate()
+    }
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         padX = dp(12f)
-        valueX = padX + dp(40f)
-        hairlineY1 = dp(38f)
-        hairlineY2 = dp(66f)
+        valueX = padX + dp(36f)
+        hairlineY1 = dp(37f)
+        hairlineY2 = dp(69f)
 
-        rectMinus.set(dp(156f), dp(8f), dp(190f), dp(34f))
-        rectPlus.set(dp(194f), dp(8f), dp(228f), dp(34f))
-        rectMode.set(dp(158f), dp(40f), dp(228f), dp(64f))
-        rectPick.set(dp(12f), dp(70f), dp(112f), dp(90f))
-        rectOpen.set(dp(120f), dp(70f), dp(228f), dp(90f))
+        val right = w.toFloat() - padX
+        rectMinus.set(right - dp(56f), dp(6f), right - dp(28f), dp(32f))
+        rectPlus.set(right - dp(26f), dp(6f), right + dp(2f), dp(32f))
+        rectMode.set(right - dp(56f), dp(39f), right, dp(65f))
+        rectPick.set(padX, dp(72f), padX + dp(90f), dp(96f))
+        rectOpen.set(padX + dp(96f), dp(72f), right, dp(96f))
+        rectToggle.set(padX, dp(102f), right, dp(126f))
 
         labelPaint.getFontMetrics(labelFm)
         readoutPaint.getFontMetrics(readoutFm)
         modePaint.getFontMetrics(modeFm)
         cellTextPaint.getFontMetrics(cellFm)
-        buttonTextPaint.getFontMetrics(buttonFm)
+        toggleTextPaint.getFontMetrics(toggleFm)
 
         baselineRow1Label = centerBaseline(dp(21f), labelFm)
         baselineRow1Readout = centerBaseline(dp(21f), readoutFm)
-        baselineRow1Button = centerBaseline(dp(21f), buttonFm)
-        baselineRow2Label = centerBaseline(dp(52f), labelFm)
-        baselineRow2Mode = centerBaseline(dp(52f), modeFm)
-        baselineRow2Button = centerBaseline(dp(52f), cellFm)
-        baselineBottom = centerBaseline(dp(80f), cellFm)
+        baselineRow1Button = centerBaseline(dp(21f), cellFm)
+        baselineRow2Label = centerBaseline(dp(53f), labelFm)
+        baselineRow2Mode = centerBaseline(dp(53f), modeFm)
+        baselineRow2Button = centerBaseline(dp(53f), cellFm)
+        baselineRow3 = centerBaseline(dp(85f), cellFm)
+        baselineToggle = centerBaseline((rectToggle.top + rectToggle.bottom) / 2f, toggleFm)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -188,18 +205,35 @@ class OverlayPanelView(context: Context) : View(context) {
         canvas.drawText("间隔", padX, baselineRow1Label, labelPaint)
         readoutPaint.color = PANEL_GRAPHITE
         canvas.drawText("${shownInterval} ms", valueX, baselineRow1Readout, readoutPaint)
-        drawButton(canvas, rectMinus, "−", false, pressedId == ID_MINUS, baselineRow1Button, buttonTextPaint)
-        drawButton(canvas, rectPlus, "+", false, pressedId == ID_PLUS, baselineRow1Button, buttonTextPaint)
+        drawButton(canvas, rectMinus, "−", pressedId == ID_MINUS, baselineRow1Button, cellTextPaint)
+        drawButton(canvas, rectPlus, "+", pressedId == ID_PLUS, baselineRow1Button, cellTextPaint)
 
         // 第二行：模式
         canvas.drawText("模式", padX, baselineRow2Label, labelPaint)
         modePaint.color = PANEL_GRAPHITE
         canvas.drawText(modeName(shownMode), valueX, baselineRow2Mode, modePaint)
-        drawButton(canvas, rectMode, "切换", false, pressedId == ID_MODE, baselineRow2Button, cellTextPaint)
+        drawButton(canvas, rectMode, "切换", pressedId == ID_MODE, baselineRow2Button, cellTextPaint)
 
-        // 底部：两个文字按钮
-        drawTextButton(canvas, rectPick, "框选落点", pressedId == ID_PICK)
-        drawTextButton(canvas, rectOpen, "打开疾点", pressedId == ID_OPEN)
+        // 第三行：两个文字按钮
+        drawTextButton(canvas, rectPick, "框选落点", pressedId == ID_PICK, baselineRow3)
+        drawTextButton(canvas, rectOpen, "打开疾点", pressedId == ID_OPEN, baselineRow3)
+
+        // 第四行：通栏启停键
+        drawToggleButton(canvas)
+    }
+
+    private fun drawToggleButton(canvas: Canvas) {
+        fillPaint.color = if (engineRunning) PANEL_SIGNAL else PANEL_GRAPHITE
+        canvas.drawRect(rectToggle, fillPaint)
+        toggleTextPaint.color = PANEL_IVORY
+        val text = if (engineRunning) "停止连点" else "启动连点"
+        val textWidth = toggleTextPaint.measureText(text)
+        canvas.drawText(
+            text,
+            rectToggle.centerX() - textWidth / 2f,
+            baselineToggle,
+            toggleTextPaint,
+        )
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -243,6 +277,7 @@ class OverlayPanelView(context: Context) : View(context) {
             ID_MODE -> cycleMode()
             ID_PICK -> listener?.onPickRegion()
             ID_OPEN -> listener?.onOpenApp()
+            ID_TOGGLE -> listener?.onToggle()
         }
     }
 
@@ -252,15 +287,20 @@ class OverlayPanelView(context: Context) : View(context) {
         rectMode.contains(x, y) -> ID_MODE
         rectPick.contains(x, y) -> ID_PICK
         rectOpen.contains(x, y) -> ID_OPEN
+        rectToggle.contains(x, y) -> ID_TOGGLE
         else -> ID_NONE
     }
 
+    /** 按阶梯步进：先找当前值所在的档位，再跳到相邻档；不在档位上就取最近档。 */
     private fun stepInterval(direction: Int) {
+        val ladder = ClickConfig.INTERVAL_LADDER
         val current = shownInterval
         val next = if (direction > 0) {
-            ClickConfig.INTERVAL_PRESETS.firstOrNull { it > current } ?: (current + 10L)
+            ladder.firstOrNull { it > current }
+                ?: (current + 500L)
         } else {
-            ClickConfig.INTERVAL_PRESETS.lastOrNull { it < current } ?: (current - 10L)
+            ladder.lastOrNull { it < current }
+                ?: (current - 1L)
         }
         val value = next.coerceIn(ClickConfig.MIN_INTERVAL_MS, ClickConfig.MAX_INTERVAL_MS)
         if (value == current) return
@@ -300,12 +340,11 @@ class OverlayPanelView(context: Context) : View(context) {
         canvas: Canvas,
         rect: RectF,
         text: String,
-        filled: Boolean,
         pressed: Boolean,
         baseline: Float,
         textPaint: Paint,
     ) {
-        if (filled || pressed) {
+        if (pressed) {
             fillPaint.color = PANEL_GRAPHITE
             canvas.drawRect(rect, fillPaint)
             textPaint.color = PANEL_IVORY
@@ -320,7 +359,7 @@ class OverlayPanelView(context: Context) : View(context) {
         canvas.drawText(text, rect.centerX() - textWidth / 2f, baseline, textPaint)
     }
 
-    private fun drawTextButton(canvas: Canvas, rect: RectF, text: String, pressed: Boolean) {
+    private fun drawTextButton(canvas: Canvas, rect: RectF, text: String, pressed: Boolean, baseline: Float) {
         if (pressed) {
             fillPaint.color = PANEL_GRAPHITE
             canvas.drawRect(rect, fillPaint)
@@ -329,7 +368,7 @@ class OverlayPanelView(context: Context) : View(context) {
             cellTextPaint.color = PANEL_GRAPHITE
         }
         val textWidth = cellTextPaint.measureText(text)
-        canvas.drawText(text, rect.centerX() - textWidth / 2f, baselineBottom, cellTextPaint)
+        canvas.drawText(text, rect.centerX() - textWidth / 2f, baseline, cellTextPaint)
     }
 
     private fun modeName(mode: TapMode): String = when (mode) {
@@ -356,6 +395,11 @@ class OverlayPanelView(context: Context) : View(context) {
         private const val ID_MODE = 3
         private const val ID_PICK = 4
         private const val ID_OPEN = 5
+        private const val ID_TOGGLE = 6
+
+        /** 面板尺寸（dp）：宿主按这个值挂窗口。 */
+        const val PANEL_WIDTH_DP = 212f
+        const val PANEL_HEIGHT_DP = 132f
 
         private val MODE_ORDER = listOf(
             TapMode.SINGLE,

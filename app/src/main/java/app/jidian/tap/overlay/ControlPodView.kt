@@ -1,18 +1,15 @@
 package app.jidian.tap.overlay
 
-import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.RectF
 import android.os.SystemClock
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.animation.DecelerateInterpolator
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
@@ -24,26 +21,25 @@ private val POD_IVORY = Color.parseColor("#EDEAE3")
 private val POD_SIGNAL = Color.parseColor("#C6372A")
 
 /**
- * 收起态悬浮圆盘（64dp）：石墨底 + 象牙表圈 + 60 根刻度。
+ * 收起态悬浮圆盘（宿主按 52dp 窗口挂载，视觉圆盘约 46dp）。
  *
- * - 待命：象牙播放三角；运行中：信号红方块 + 计数变化时外圈红弧脉冲（200ms 衰减）。
- * - 触摸：拖动 → [Listener.onDragBy]；轻点 → [Listener.onToggle]；长按 350ms →
- *   [Listener.onExpandRequested]；双击 → [Listener.onOpenApp]。
+ * 交互只有三个，全部在 350ms 内可预期，不存在「点了没反应」的死区：
+ * - **轻点**（任何时长，只要没拖没长按）→ [Listener.onToggle] 立即启停，无 300ms 延时；
+ * - **长按 350ms** → [Listener.onExpandRequested] 展开面板（面板里有更大的启停键）；
+ * - **拖动** → [Listener.onDragBy] / [Listener.onDragFinished]。
  *
- * 性能约定：Paint/Path/RectF 全部复用，[onDraw] 内不分配对象；不跑持续动画，
- * 只有运行中收到点击计数变化时才启动一次 200ms 的 ValueAnimator。
+ * 视觉：石墨底 + 象牙表圈 + 12 根刻度；待命象牙播放三角，运行中信号红方块 +
+ * 红色短弧。**没有任何常驻动画**：只在引擎状态变化时重绘一次，避免悬浮窗持续
+ * 60fps 重绘拖慢整机。
  */
 class ControlPodView(context: Context) : View(context) {
 
     interface Listener {
-        /** 轻点（≤180ms 且未滑动）。宿主决定是启停引擎还是先收起面板。 */
+        /** 轻点：宿主切换引擎启停。 */
         fun onToggle()
 
         /** 长按 350ms：请求展开迷你面板。 */
         fun onExpandRequested()
-
-        /** 双击：打开疾点主界面。 */
-        fun onOpenApp()
 
         /** 拖动中：窗口位置偏移 (dx, dy) 像素。 */
         fun onDragBy(dx: Int, dy: Int)
@@ -54,21 +50,14 @@ class ControlPodView(context: Context) : View(context) {
 
     var listener: Listener? = null
 
-    /** 引擎是否运行中（由宿主每 100ms 采样后推进来）。 */
+    /** 引擎是否运行中（由宿主采样后推进来，只在变化时重绘）。 */
     private var engineRunning = false
-
-    /** 上一次采样到的本次点击计数，用于判断「计数变化」。 */
-    private var lastSessionTaps = 0L
-
-    /** 脉冲进度 0→1；初始为 1 表示不显示（未运行/动画已结束）。 */
-    private var pulseFraction = 1f
 
     private var centerX = 0f
     private var centerY = 0f
     private var radius = 0f
 
     private val playPath = Path()
-    private val pulseRect = RectF()
 
     private var downX = 0f
     private var downY = 0f
@@ -77,8 +66,6 @@ class ControlPodView(context: Context) : View(context) {
     private var downAtMs = 0L
     private var dragging = false
     private var longPressFired = false
-    private var singleTapPending = false
-    private var lastTapUpMs = 0L
 
     private val touchSlop: Int = ViewConfiguration.get(context).scaledTouchSlop
 
@@ -95,9 +82,9 @@ class ControlPodView(context: Context) : View(context) {
 
     private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = dp(0.8f)
+        strokeWidth = dp(0.9f)
         strokeCap = Paint.Cap.ROUND
-        color = withAlpha(POD_IVORY, 0.10f)
+        color = withAlpha(POD_IVORY, 0.16f)
     }
 
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -110,59 +97,29 @@ class ControlPodView(context: Context) : View(context) {
         color = POD_SIGNAL
     }
 
-    private val pulsePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val runRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(1.5f)
         strokeCap = Paint.Cap.ROUND
         color = POD_SIGNAL
     }
 
-    private val pulseAnimator: ValueAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = PULSE_DURATION_MS
-        interpolator = DecelerateInterpolator()
-        addUpdateListener { animation ->
-            pulseFraction = animation.animatedFraction
-            invalidate()
-        }
-    }
-
     private val longPressRunnable = Runnable {
         if (!dragging && !longPressFired) {
             longPressFired = true
-            lastTapUpMs = 0L
+            isPressed = false
+            invalidate()
             listener?.onExpandRequested()
         }
     }
 
-    private val singleTapRunnable = Runnable {
-        if (singleTapPending) {
-            singleTapPending = false
-            listener?.onToggle()
-        }
-    }
-
     /**
-     * 宿主采样入口：每 100ms 调一次，只有状态或计数变化时才 invalidate。
-     * 计数变化且运行中 → 触发一次脉冲。
+     * 宿主采样入口：每 250ms 调一次；只有运行状态变化时才 invalidate。
      */
-    fun applyEngineState(running: Boolean, sessionTaps: Long) {
-        val tapsChanged = running && engineRunning && sessionTaps != lastSessionTaps
-        if (running == engineRunning && !tapsChanged) return
+    fun applyEngineState(running: Boolean) {
+        if (running == engineRunning) return
         engineRunning = running
-        lastSessionTaps = sessionTaps
-        when {
-            !running -> {
-                if (pulseAnimator.isRunning) pulseAnimator.cancel()
-                pulseFraction = 1f
-                invalidate()
-            }
-            tapsChanged -> {
-                // 视觉上限：一次脉冲没走完就不再叠加，避免高频闪烁
-                if (!pulseAnimator.isRunning) pulseAnimator.start()
-                invalidate()
-            }
-            else -> invalidate()
-        }
+        invalidate()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -170,11 +127,11 @@ class ControlPodView(context: Context) : View(context) {
         centerX = w / 2f
         centerY = h / 2f
         radius = min(w.toFloat(), h.toFloat()) / 2f - dp(1f)
-        val size = dp(20f)
+        val size = dp(16f)
         playPath.reset()
-        playPath.moveTo(centerX - size * 0.41f, centerY - size * 0.5f)
-        playPath.lineTo(centerX + size * 0.41f, centerY)
-        playPath.lineTo(centerX - size * 0.41f, centerY + size * 0.5f)
+        playPath.moveTo(centerX - size * 0.38f, centerY - size * 0.5f)
+        playPath.lineTo(centerX + size * 0.44f, centerY)
+        playPath.lineTo(centerX - size * 0.38f, centerY + size * 0.5f)
         playPath.close()
     }
 
@@ -184,14 +141,14 @@ class ControlPodView(context: Context) : View(context) {
 
         canvas.drawCircle(centerX, centerY, r, discPaint)
 
-        // 表圈：1dp 象牙描边，位于 88% 半径
+        // 表圈：1dp 象牙描边
         ringPaint.color = POD_IVORY
-        canvas.drawCircle(centerX, centerY, r * 0.88f, ringPaint)
+        canvas.drawCircle(centerX, centerY, r * 0.90f, ringPaint)
 
-        // 60 根 6° 刻度：10% 象牙，按下时提亮
-        tickPaint.color = withAlpha(POD_IVORY, if (isPressed) 0.30f else 0.10f)
-        val outer = r * 0.84f
-        val inner = outer - r * 0.10f
+        // 12 根整点刻度（比 60 根省 80% 的绘制调用，视觉上更像计时码表）
+        tickPaint.color = withAlpha(POD_IVORY, if (isPressed) 0.42f else 0.18f)
+        val outer = r * 0.82f
+        val inner = outer - r * 0.14f
         var i = 0
         while (i < TICK_COUNT) {
             val angle = Math.toRadians(i * 360.0 / TICK_COUNT)
@@ -208,27 +165,26 @@ class ControlPodView(context: Context) : View(context) {
         }
 
         if (engineRunning) {
-            // 运行中：信号红方块 14dp
-            val half = dp(7f)
+            // 运行中：信号红方块（停止的通用语义）+ 外圈短弧
+            val half = dp(5.5f)
             canvas.drawRect(centerX - half, centerY - half, centerX + half, centerY + half, signalPaint)
-            if (pulseAnimator.isRunning) {
-                val progress = pulseFraction
-                pulsePaint.color = withAlpha(POD_SIGNAL, (1f - progress) * 0.9f)
-                val pulseRadius = r * (0.30f + 0.60f * progress)
-                pulseRect.set(
-                    centerX - pulseRadius,
-                    centerY - pulseRadius,
-                    centerX + pulseRadius,
-                    centerY + pulseRadius,
-                )
-                canvas.drawArc(pulseRect, 210f, 120f, false, pulsePaint)
-            }
+            canvas.drawArc(
+                centerX - r * 0.62f,
+                centerY - r * 0.62f,
+                centerX + r * 0.62f,
+                centerY + r * 0.62f,
+                200f,
+                140f,
+                false,
+                runRingPaint,
+            )
         } else {
-            // 待命：象牙播放三角 20dp
+            // 待命：象牙播放三角
             canvas.drawPath(playPath, iconPaint)
         }
     }
 
+    @Suppress("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -256,9 +212,6 @@ class ControlPodView(context: Context) : View(context) {
                 ) {
                     dragging = true
                     removeCallbacks(longPressRunnable)
-                    removeCallbacks(singleTapRunnable)
-                    singleTapPending = false
-                    lastTapUpMs = 0L
                 }
                 if (dragging) listener?.onDragBy(dx.roundToInt(), dy.roundToInt())
                 return true
@@ -277,8 +230,8 @@ class ControlPodView(context: Context) : View(context) {
                     longPressFired = false
                     return true
                 }
-                val duration = SystemClock.uptimeMillis() - downAtMs
-                if (duration <= TAP_MAX_MS) handleTap()
+                // 只要没被拖走、没触发长按，任何按压时长都算一次轻点 → 立即启停
+                listener?.onToggle()
                 return true
             }
 
@@ -299,29 +252,10 @@ class ControlPodView(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         removeCallbacks(longPressRunnable)
-        removeCallbacks(singleTapRunnable)
+        isPressed = false
         longPressFired = false
-        singleTapPending = false
         dragging = false
-        if (pulseAnimator.isRunning) pulseAnimator.cancel()
-        pulseFraction = 1f
         super.onDetachedFromWindow()
-    }
-
-    /** 区分单击与双击：单击延迟 280ms 等第二击，双击立刻打开主界面。 */
-    private fun handleTap() {
-        val now = SystemClock.uptimeMillis()
-        if (lastTapUpMs > 0L && now - lastTapUpMs <= DOUBLE_TAP_MS) {
-            lastTapUpMs = 0L
-            singleTapPending = false
-            removeCallbacks(singleTapRunnable)
-            listener?.onOpenApp()
-            return
-        }
-        lastTapUpMs = now
-        singleTapPending = true
-        removeCallbacks(singleTapRunnable)
-        postDelayed(singleTapRunnable, SINGLE_TAP_DELAY_MS)
     }
 
     private fun dp(value: Float): Float =
@@ -331,11 +265,7 @@ class ControlPodView(context: Context) : View(context) {
         (color and 0x00FFFFFF) or (((alpha.coerceIn(0f, 1f) * 255f) + 0.5f).toInt() shl 24)
 
     companion object {
-        private const val TICK_COUNT = 60
-        private const val PULSE_DURATION_MS = 200L
+        private const val TICK_COUNT = 12
         private const val LONG_PRESS_MS = 350L
-        private const val TAP_MAX_MS = 180L
-        private const val DOUBLE_TAP_MS = 300L
-        private const val SINGLE_TAP_DELAY_MS = 300L
     }
 }
