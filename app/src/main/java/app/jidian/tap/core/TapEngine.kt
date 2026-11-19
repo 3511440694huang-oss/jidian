@@ -116,11 +116,27 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
 
     // ── 以下状态只在引擎线程读写 ──────────────────────────────────────────────
     private var consecutiveFailures = 0
+    private var consecutiveCancels = 0
     private var buildFailures = 0
     private var screenW = 0
     private var screenH = 0
     private var screenOrientation = Int.MIN_VALUE
     private val random = Random()
+
+    /**
+     * 系统允许的 GestureDescription 最大 Stroke 数（框架固定为 10）。
+     * 合并连点用满它，把一次 dispatchGesture 往返摊到 10 次点击上。
+     */
+    private val maxStrokes: Int = runCatching { GestureDescription.getMaxStrokeCount() }
+        .getOrDefault(DEFAULT_MAX_STROKES)
+        .coerceAtLeast(1)
+
+    /**
+     * 合并连点在当前会话内被系统连续取消后自动降级：整批点击都落不下去时，
+     * 再合并只会更糟，退回「一次手势一次点击」至少保证能用。
+     */
+    @Volatile
+    private var batchingBlocked = false
 
     private val priorityRunnable = Runnable {
         // 手势派发对时序敏感，把引擎线程提到显示优先级；失败也不影响正确性
@@ -184,6 +200,8 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
             waitingForService = false
             pendingStart = false
             sessionTaps.set(0L)
+            batchingBlocked = false
+            consecutiveCancels = 0
             sessionStartedElapsed = SystemClock.elapsedRealtime()
             lastStopReason = null
             nextTargetUptime = 0L
@@ -274,8 +292,8 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
         if (!running || dispatching) return
         val cfg = latestConfig
         ensureScreenSize()
-        val gesture = buildGesture(cfg)
-        if (gesture == null) {
+        val built = buildGesture(cfg)
+        if (built == null) {
             dropped.incrementAndGet()
             publishStatus(force = false)
             postNext()
@@ -290,16 +308,21 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
         val now = SystemClock.uptimeMillis()
         // 目标时刻按上一轮目标累加，保证长跑不漂；已经落后就对齐到当前时刻，避免瞬间补点
         val scheduledAt = if (nextTargetUptime <= 0L) now else max(nextTargetUptime, now)
-        nextTargetUptime = scheduledAt +
+        // 批次里有 taps 次点击就顺延 taps 个间隔；双击模式仍以「一对」为单位走一个间隔
+        val step = if (cfg.mode == TapMode.SINGLE) {
+            built.taps.toLong() * Geometry.nextIntervalMs(cfg.intervalMs, cfg.intervalJitterPct, random)
+        } else {
             Geometry.nextIntervalMs(cfg.intervalMs, cfg.intervalJitterPct, random)
+        }
+        nextTargetUptime = scheduledAt + step
         val seq = gestureSeq.incrementAndGet()
         dispatching = true
-        val timeoutMs = max(MIN_WATCHDOG_MS, gestureDurationMs(cfg) + WATCHDOG_MARGIN_MS)
+        val timeoutMs = max(MIN_WATCHDOG_MS, built.durationMs + WATCHDOG_MARGIN_MS)
         handler.removeCallbacks(watchdogRunnable)
         handler.postAtTime(watchdogRunnable, now + timeoutMs)
         val callback = GestureDoneCallback(seq)
         val accepted = try {
-            service.dispatchGesture(gesture, callback, handler)
+            service.dispatchGesture(built.gesture, callback, handler)
         } catch (t: Throwable) {
             JidianLog.error(TAG, "手势派发异常：${t.message}")
             false
@@ -328,7 +351,7 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
             return
         }
         consecutiveFailures = 0
-        val taps = tapsPerGesture(cfg.mode)
+        val taps = built.taps.toLong()
         val session = sessionTaps.addAndGet(taps)
         totalTaps.addAndGet(taps)
         publishStatus(force = false)
@@ -354,7 +377,14 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
         if (cancelled) {
             // 被系统取消（别的服务抢手势、屏幕切换等）：这一轮没有真正落下，记一次丢弃
             dropped.incrementAndGet()
+            consecutiveCancels += 1
+            if (consecutiveCancels >= MAX_CONSECUTIVE_CANCELS && latestConfig.batchTaps && !batchingBlocked) {
+                batchingBlocked = true
+                JidianLog.warn(TAG, "合并连点连续 $consecutiveCancels 次被系统取消，本会话降级为单次派发")
+            }
             publishStatus(force = false)
+        } else {
+            consecutiveCancels = 0
         }
         if (!running) return
         postNext()
@@ -384,16 +414,25 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
 
     // ── 手势构建 ─────────────────────────────────────────────────────────────
 
-    private fun buildGesture(cfg: ClickConfig): GestureDescription? {
+    /**
+     * 一次派发的完整内容：手势本身、其中包含的点击次数、手势总时长。
+     *
+     * 手势总时长要按实际批次算（`最后一个 Stroke 的 startTime + 触点时长`），
+     * 看门狗阈值依赖它；长按 / 滑动仍然用各自配置时长。
+     */
+    private class BuiltGesture(
+        val gesture: GestureDescription,
+        val taps: Int,
+        val durationMs: Long,
+    )
+
+    private fun buildGesture(cfg: ClickConfig): BuiltGesture? {
         val w = screenW
         val h = screenH
         return try {
             val builder = GestureDescription.Builder()
             when (cfg.mode) {
-                TapMode.SINGLE -> {
-                    val p = Geometry.samplePoint(cfg, w, h, random)
-                    builder.addStroke(pointStroke(p, 0L, tapDurationMs(cfg), w, h))
-                }
+                TapMode.SINGLE -> buildSingleBatch(cfg, builder, w, h)
 
                 TapMode.DOUBLE -> {
                     // 双击的关键：两个 Stroke 放进同一个 GestureDescription，只走一次 IPC
@@ -401,20 +440,22 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
                     val tapMs = tapDurationMs(cfg)
                     builder.addStroke(pointStroke(p, 0L, tapMs, w, h))
                     builder.addStroke(pointStroke(p, cfg.doubleGapMs, tapMs, w, h))
+                    BuiltGesture(builder.build(), taps = 2, durationMs = cfg.doubleGapMs + tapMs)
                 }
 
                 TapMode.LONG_PRESS -> {
                     val p = Geometry.samplePoint(cfg, w, h, random)
                     builder.addStroke(pointStroke(p, 0L, cfg.longPressMs, w, h))
+                    BuiltGesture(builder.build(), taps = 1, durationMs = cfg.longPressMs)
                 }
 
                 TapMode.SWIPE -> {
                     val start = Geometry.samplePoint(cfg, w, h, random)
                     val end = Geometry.swipeEnd(start, cfg.swipeDx, cfg.swipeDy, w, h)
                     builder.addStroke(swipeStroke(start, end, cfg.swipeDurationMs))
+                    BuiltGesture(builder.build(), taps = 1, durationMs = cfg.swipeDurationMs)
                 }
             }
-            builder.build()
         } catch (t: Throwable) {
             // 构建失败极其少见（配置已经 sanitize），只记前几次，避免故障时刷日志
             if (buildFailures < MAX_BUILD_FAILURE_LOGS) {
@@ -423,6 +464,42 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
             }
             null
         }
+    }
+
+    /**
+     * 单击批次：把 1–10 次点击放进同一个 GestureDescription。
+     *
+     * 每批最多 [maxStrokes] 个 Stroke、总跨度不超过 [Geometry.BATCH_MAX_SPAN_MS]，
+     * 所以 1ms 档一批 10 次（10ms），20ms 档一批 3 次（40ms）——停止时最多残留几十毫秒。
+     * 每次点击仍各自在随机范围内采样落点。
+     */
+    private fun buildSingleBatch(
+        cfg: ClickConfig,
+        builder: GestureDescription.Builder,
+        w: Int,
+        h: Int,
+    ): BuiltGesture {
+        val starts = if (cfg.batchTaps && !batchingBlocked) {
+            Geometry.planBatchStarts(cfg.intervalMs, cfg.intervalJitterPct, maxStrokes, random)
+        } else {
+            listOf(0L)
+        }
+        // 点击上限要卡在批内，不能一批冲过上限太多
+        val remaining = if (cfg.limitCount > 0) {
+            (cfg.limitCount - sessionTaps.get()).coerceAtLeast(1L)
+        } else {
+            Long.MAX_VALUE
+        }
+        val count = minOf(starts.size.toLong(), remaining).toInt().coerceAtLeast(1)
+        val tapMs = tapDurationMs(cfg)
+        var last = 0L
+        for (index in 0 until count) {
+            val at = starts[index]
+            val p = Geometry.samplePoint(cfg, w, h, random)
+            builder.addStroke(pointStroke(p, at, tapMs, w, h))
+            last = at
+        }
+        return BuiltGesture(builder.build(), taps = count, durationMs = last + tapMs)
     }
 
     /**
@@ -461,21 +538,12 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
      * 触点时长：常规 1–8ms（短到只被当作一次点击，又留一点随机性降低特征）。
      *
      * 极限节奏（间隔 ≤ [ClickConfig.ULTRA_FAST_THRESHOLD_MS]）压到 1ms：
-     * 触点时长不能超过节奏本身，否则回调链根本追不上目标间隔。
+     * 触点时长不能超过节奏本身，否则批次里相邻 Stroke 会挤在一起。
      */
     private fun tapDurationMs(cfg: ClickConfig): Long =
         if (cfg.ultraFast) TAP_DURATION_MIN_MS
         else TAP_DURATION_MIN_MS +
             random.nextInt((TAP_DURATION_MAX_MS - TAP_DURATION_MIN_MS + 1).toInt()).toLong()
-
-    private fun gestureDurationMs(cfg: ClickConfig): Long = when (cfg.mode) {
-        TapMode.SINGLE -> if (cfg.ultraFast) TAP_DURATION_MIN_MS else TAP_DURATION_MAX_MS
-        TapMode.DOUBLE -> cfg.doubleGapMs + tapDurationMs(cfg)
-        TapMode.LONG_PRESS -> cfg.longPressMs
-        TapMode.SWIPE -> cfg.swipeDurationMs
-    }
-
-    private fun tapsPerGesture(mode: TapMode): Long = if (mode == TapMode.DOUBLE) 2L else 1L
 
     // ── 屏幕尺寸 ─────────────────────────────────────────────────────────────
 
@@ -602,6 +670,12 @@ class TapEngine(context: Context, configStore: ConfigStore) : TapEngineApi {
         private const val TIMEOUT_WARN_EVERY = 20
 
         private const val MAX_BUILD_FAILURE_LOGS = 3
+
+        /** 合并连点连续被取消多少次后降级（本会话内改回单次派发）。 */
+        private const val MAX_CONSECUTIVE_CANCELS = 5
+
+        /** getMaxStrokeCount() 取不到时的兜底值（框架常量就是 10）。 */
+        private const val DEFAULT_MAX_STROKES = 10
 
         /** 所有系统接口都取不到尺寸时的兜底值。 */
         private const val FALLBACK_SCREEN_W = 1080

@@ -203,4 +203,47 @@ class GeometryTest {
         assertEquals(first.x, second.x, 0.0001f)
         assertEquals(first.y, second.y, 0.0001f)
     }
+
+    // —— 合并连点批次规划 ——
+
+    @Test
+    fun batchAtOneMillisecondPacksTenStrokes() {
+        val starts = Geometry.planBatchStarts(1L, 0, 10, Random(1))
+        assertEquals(10, starts.size)
+        assertEquals(0L, starts.first())
+        assertEquals(9L, starts.last())
+    }
+
+    @Test
+    fun batchStopsWhenSpanWouldExceedLimit() {
+        // 10ms 档一批 5 次（0/10/20/30/40），再下一次会到 50ms 超过 48ms 上限
+        val ten = Geometry.planBatchStarts(10L, 0, 10, Random(2))
+        assertEquals(listOf(0L, 10L, 20L, 30L, 40L), ten)
+
+        // 16ms 档一批 4 次，最后一个是 48ms（正好在上限上）
+        val sixteen = Geometry.planBatchStarts(16L, 0, 10, Random(3))
+        assertEquals(listOf(0L, 16L, 32L, 48L), sixteen)
+
+        // 30ms 档一批 2 次
+        assertEquals(listOf(0L, 30L), Geometry.planBatchStarts(30L, 0, 10, Random(4)))
+
+        // 慢速不合并：一个批次就是一次点击
+        assertEquals(listOf(0L), Geometry.planBatchStarts(50L, 0, 10, Random(5)))
+        assertEquals(listOf(0L), Geometry.planBatchStarts(1L, 0, 1, Random(6)))
+    }
+
+    @Test
+    fun batchWithJitterStaysOrderedAndWithinSpan() {
+        val rng = Random(20261119)
+        repeat(500) {
+            val starts = Geometry.planBatchStarts(7L, 60, 10, rng)
+            assertTrue(starts.isNotEmpty())
+            assertEquals(0L, starts.first())
+            assertTrue(starts.size <= 10)
+            assertTrue("批次总跨度必须受限：$starts", starts.last() <= Geometry.BATCH_MAX_SPAN_MS)
+            starts.zipWithNext().forEach { (a, b) ->
+                assertTrue("批次内起点必须递增且间隔 ≥1ms：$starts", b > a)
+            }
+        }
+    }
 }

@@ -634,7 +634,18 @@ private fun RhythmSection(
                 )
             }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(10.dp))
+        JdSwitchRow(
+            label = "合并连点（极限提速）",
+            checked = config.batchTaps,
+            onCheckedChange = { checked -> update { it.copy(batchTaps = checked) } },
+        )
+        Spacer(Modifier.height(2.dp))
+        JdNote(
+            text = "开启后把多次点击合并进一个手势，1ms 档不再被单次派发的 5–7ms 往返卡住；" +
+                "目标应用对多点触控敏感时可关闭",
+        )
+        Spacer(Modifier.height(10.dp))
         JdNote(
             text = "可输入 1–10000 ms。1–16 ms 是极限档：能跑多快取决于机型的手势注入上限，" +
                 "以顶部「实际频率」为准",
@@ -829,6 +840,7 @@ private fun LandingSection(
     update: ((ClickConfig) -> ClickConfig) -> Unit,
     onPickRegion: () -> Unit,
 ) {
+    val context = LocalContext.current
     Column(Modifier.fillMaxWidth()) {
         JdSectionHeader(title = "落点")
         Spacer(Modifier.height(12.dp))
@@ -874,7 +886,7 @@ private fun LandingSection(
                     )
                     if (!config.regionConfigured) {
                         Spacer(Modifier.height(8.dp))
-                        JdNote("还没框选落点，将点击屏幕中心")
+                        JdNote("还没定位，将点击屏幕中心；拖动落点手柄即可移到目标上")
                     }
                 }
             }
@@ -895,6 +907,21 @@ private fun LandingSection(
                 )
             }
         }
+        Spacer(Modifier.height(10.dp))
+        JdSwitchRow(
+            label = "落点手柄",
+            checked = config.showRegionHandle,
+            onCheckedChange = { enabled ->
+                update { it.copy(showRegionHandle = enabled) }
+                if (enabled) {
+                    // 打开就把悬浮服务拉起来，手柄马上出现在屏幕上（没授权会走权限引导）
+                    runCatching { FloatService.show(context) }
+                        .onFailure { JidianLog.warn("UI", "显示落点手柄失败：${it.message}") }
+                }
+            },
+        )
+        Spacer(Modifier.height(2.dp))
+        JdNote("屏幕上显示半透明落点区域，直接拖动即可定位；连点运行时自动让触摸穿透")
         Spacer(Modifier.height(18.dp))
         ParamSlider(
             label = "随机偏移",

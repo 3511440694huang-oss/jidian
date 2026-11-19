@@ -27,6 +27,7 @@ import app.jidian.tap.core.RegionShape
 import app.jidian.tap.core.StopReason
 import app.jidian.tap.overlay.ControlPodView
 import app.jidian.tap.overlay.OverlayPanelView
+import app.jidian.tap.overlay.RegionHandleView
 import app.jidian.tap.overlay.RegionPickerView
 import app.jidian.tap.util.Notifications
 
@@ -52,12 +53,27 @@ class FloatService : Service() {
     private var panelView: OverlayPanelView? = null
     private var scrimView: View? = null
     private var pickerView: RegionPickerView? = null
+    private var handleView: RegionHandleView? = null
+    private var handleParams: WindowManager.LayoutParams? = null
 
     private var sampling = false
     private var lastEngineRunning = false
-    private var pendingDx = 0
-    private var pendingDy = 0
-    private var dragFlushScheduled = false
+    private var draggingPod = false
+    private var handleDragging = false
+
+    /**
+     * 拖动圆盘时如果引擎正在跑，先暂停、松手再恢复。
+     *
+     * 拖动需要把圆盘窗口临时铺满全屏；无障碍注入的点击会命中这个全屏窗口，
+     * 可能反过来触发轻点/长按（甚至把连点停掉）。暂停几百毫秒比出这种怪行为划算，
+     * 而且拖动本来就不该一边拖一边点。
+     */
+    private var resumeEngineAfterPodDrag = false
+
+    /** 配置变化（含落点手柄拖动落盘）都会走这里刷新手柄几何。 */
+    private val configListener: (ClickConfig) -> Unit = {
+        mainHandler.post { refreshHandle() }
+    }
 
     // ------------------------------------------------------------------ 生命周期
 
@@ -67,6 +83,7 @@ class FloatService : Service() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         overlayPrefs = getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
         Notifications.ensureChannel(this)
+        runCatching { JidianApp.from(this).config.addListener(configListener) }
 
         val runningNow = runCatching { JidianApp.from(this).engine.isRunning }.getOrDefault(false)
         lastEngineRunning = runningNow
@@ -113,11 +130,15 @@ class FloatService : Service() {
                     return Service.START_NOT_STICKY
                 }
                 collapsePanel()
+                closeHandle()
                 enterPicker()
             }
 
             else -> {
-                // ACTION_SHOW，或系统重启后的空 intent：确保圆盘在
+                // ACTION_SHOW，或系统重启后的空 intent。
+                // 先挂落点手柄、再挂圆盘：同类型 overlay 后添加的在上层，
+                // 这样两者重叠时圆盘仍然可点，不会被手柄挡住。
+                refreshHandle()
                 if (!ensurePod()) {
                     stopSelf()
                     return Service.START_NOT_STICKY
@@ -133,8 +154,16 @@ class FloatService : Service() {
         // 屏幕方向/尺寸变化：依赖屏幕坐标的浮层收掉，圆盘夹回可视区
         if (pickerView != null) closePicker()
         if (panelView != null || scrimView != null) collapsePanel()
+        if (draggingPod) {
+            val dragView = podView
+            if (dragView != null) finishPodDrag(dragView.dragLeft(), dragView.dragTop())
+        }
+        closeHandle()
+        refreshHandle()
         val view = podView ?: return
         val params = podParams ?: return
+        val size = dp(POD_SIZE_DP)
+        view.setMetrics(size.toFloat(), screenWidth(), screenHeight())
         clampPodParams(params)
         try {
             windowManager.updateViewLayout(view, params)
@@ -149,8 +178,10 @@ class FloatService : Service() {
         isRunning = false
         stopSampling()
         mainHandler.removeCallbacks(podReclampRunnable)
+        runCatching { JidianApp.from(this).config.removeListener(configListener) }
         closePicker()
         collapsePanel()
+        closeHandle()
         val pod = podView
         podView = null
         podParams = null
@@ -198,6 +229,7 @@ class FloatService : Service() {
         if (status.running != lastEngineRunning) {
             lastEngineRunning = status.running
             updateNotification(status.running)
+            applyHandleRunning(status.running)
         }
     }
 
@@ -217,6 +249,7 @@ class FloatService : Service() {
         val view = ControlPodView(this)
         view.listener = podListener
         val size = dp(POD_SIZE_DP)
+        view.setMetrics(size.toFloat(), screenWidth(), screenHeight())
         val params = newOverlayParams(
             size,
             size,
@@ -243,6 +276,8 @@ class FloatService : Service() {
     private fun applyPodClamp() {
         val view = podView ?: return
         val params = podParams ?: return
+        val size = dp(POD_SIZE_DP)
+        view.setMetrics(size.toFloat(), screenWidth(), screenHeight())
         clampPodParams(params)
         try {
             windowManager.updateViewLayout(view, params)
@@ -270,51 +305,82 @@ class FloatService : Service() {
             }
         }
 
-        override fun onDragBy(dx: Int, dy: Int) {
-            // 触摸事件比屏幕刷新快：先把位移攒起来，每帧只 updateViewLayout 一次，
-            // 避免每个 MOVE 都走一次 WindowManager IPC 造成拖拽发涩。
-            pendingDx += dx
-            pendingDy += dy
-            if (!dragFlushScheduled) {
-                dragFlushScheduled = true
-                mainHandler.post(dragFlushRunnable)
-            }
+        override fun onDragBegin() {
+            beginPodDrag()
         }
 
-        override fun onDragFinished() {
-            mainHandler.removeCallbacks(dragFlushRunnable)
-            dragFlushScheduled = false
-            flushDrag()
-            val params = podParams ?: return
-            applyPodClamp()
-            overlayPrefs.edit()
-                .putInt(KEY_POD_X, params.x)
-                .putInt(KEY_POD_Y, params.y)
-                .apply()
+        override fun onDragFinished(left: Int, top: Int) {
+            finishPodDrag(left, top)
         }
     }
 
-    private val dragFlushRunnable = Runnable {
-        dragFlushScheduled = false
-        flushDrag()
-    }
-
-    private fun flushDrag() {
-        if (pendingDx == 0 && pendingDy == 0) return
-        val view = podView ?: run {
-            pendingDx = 0
-            pendingDy = 0
-            return
-        }
+    /**
+     * 拖动开始：把圆盘窗口临时铺满全屏。
+     *
+     * 之后手指的所有位移都由 [ControlPodView] 用屏幕绝对坐标换算成内部偏移，
+     * 期间不再调用 updateViewLayout —— 这是「跟手」的关键：
+     * 小窗每帧重排既贵，又会造成「窗口追手指、触摸坐标追窗口」的反馈抖动。
+     */
+    private fun beginPodDrag() {
+        val view = podView ?: return
         val params = podParams ?: return
-        params.x += pendingDx
-        params.y += pendingDy
-        pendingDx = 0
-        pendingDy = 0
+        if (draggingPod) return
+        draggingPod = true
+        // 先暂停引擎再铺屏：在途批次最多再落 1 批，不会持续打在全屏窗口上
+        val engine = runCatching { JidianApp.from(this).engine }.getOrNull()
+        resumeEngineAfterPodDrag = engine?.isRunning == true
+        if (resumeEngineAfterPodDrag) {
+            runCatching { engine?.stop(StopReason.USER) }
+            showToast("拖动中已暂停连点")
+        }
+        val originX = params.x
+        val originY = params.y
+        params.width = WindowManager.LayoutParams.MATCH_PARENT
+        params.height = WindowManager.LayoutParams.MATCH_PARENT
+        params.x = 0
+        params.y = 0
         try {
             windowManager.updateViewLayout(view, params)
-        } catch (_: Throwable) {
-            // 窗口可能正在被系统移除，忽略
+        } catch (t: Throwable) {
+            JidianLog.warn(TAG, "进入拖动模式失败：${t.message}")
+        }
+        view.beginDrag(originX, originY)
+    }
+
+    /** 拖动结束：缩回 52dp 窗口落到最终位置并持久化。 */
+    private fun finishPodDrag(left: Int, top: Int) {
+        val view = podView ?: return
+        val params = podParams ?: return
+        if (!draggingPod) return
+        draggingPod = false
+        val size = dp(POD_SIZE_DP)
+        params.width = size
+        params.height = size
+        params.x = left
+        params.y = top
+        clampPodParams(params)
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (t: Throwable) {
+            JidianLog.warn(TAG, "退出拖动模式失败：${t.message}")
+        }
+        view.endDrag()
+        overlayPrefs.edit()
+            .putInt(KEY_POD_X, params.x)
+            .putInt(KEY_POD_Y, params.y)
+            .apply()
+        // 窗口已缩回 52dp 再恢复连点，避免恢复后的点击又打在全屏窗口上
+        if (resumeEngineAfterPodDrag) {
+            resumeEngineAfterPodDrag = false
+            val engine = runCatching { JidianApp.from(this).engine }.getOrNull()
+            if (engine != null && TapAccessibilityService.isConnected) {
+                runCatching { engine.start("overlay") }
+                showToast("已恢复连点")
+                // 立刻把落点手柄切回「不可触摸」，否则恢复后的头 250ms 点击会被手柄吃掉
+                sampleEngine()
+            } else {
+                showToast("无障碍未就绪，连点未恢复")
+            }
         }
     }
 
@@ -414,6 +480,221 @@ class FloatService : Service() {
         }
     }
 
+    // ------------------------------------------------------------------ 落点手柄
+
+    /**
+     * 手柄窗口几何：窗口 = 落点区域 + 12dp 内边距，中心即真正的点击中心。
+     * 贴边时窗口被夹进屏幕，返回的 cx/cy 也用夹过之后的中心，保证「看到哪就点到哪」。
+     */
+    private data class HandleGeometry(
+        val cx: Int,
+        val cy: Int,
+        val regionW: Int,
+        val regionH: Int,
+        val winW: Int,
+        val winH: Int,
+        val x: Int,
+        val y: Int,
+    )
+
+    private fun currentConfig(): ClickConfig =
+        runCatching { JidianApp.from(this).config.snapshot() }.getOrDefault(ClickConfig.Default)
+
+    private fun computeHandleGeometry(
+        cfg: ClickConfig,
+        overrideCx: Int? = null,
+        overrideCy: Int? = null,
+    ): HandleGeometry {
+        val sw = screenWidth()
+        val sh = screenHeight()
+        val pad = dp(RegionHandleView.PAD_DP)
+        val minSide = dp(MIN_HANDLE_SIDE_DP)
+        val rw = cfg.regionW.coerceIn(minSide, sw)
+        val rh = cfg.regionH.coerceIn(minSide, sh)
+        val winW = minOf(sw, maxOf(rw + pad * 2, minSide + pad * 2))
+        val winH = minOf(sh, maxOf(rh + pad * 2, minSide + pad * 2))
+        val rawCx = overrideCx ?: if (cfg.regionConfigured) cfg.regionCx else sw / 2
+        val rawCy = overrideCy ?: if (cfg.regionConfigured) cfg.regionCy else sh / 2
+        val x = (rawCx - winW / 2).coerceIn(0, (sw - winW).coerceAtLeast(0))
+        val y = (rawCy - winH / 2).coerceIn(0, (sh - winH).coerceAtLeast(0))
+        return HandleGeometry(
+            cx = x + winW / 2,
+            cy = y + winH / 2,
+            regionW = rw,
+            regionH = rh,
+            winW = winW,
+            winH = winH,
+            x = x,
+            y = y,
+        )
+    }
+
+    /**
+     * 按当前配置增删/更新落点手柄。
+     *
+     * 引擎运行时手柄会加 FLAG_NOT_TOUCHABLE：注入的点击直接穿过去落在目标 App 上，
+     * 手柄只剩一层很淡的指示框；停止时恢复可拖动。
+     */
+    private fun refreshHandle(cfg: ClickConfig = currentConfig()) {
+        if (!Settings.canDrawOverlays(this)) {
+            closeHandle()
+            return
+        }
+        // 框选是全屏覆盖层，先让位；框选结束后会重新刷新
+        if (!cfg.showRegionHandle || pickerView != null) {
+            closeHandle()
+            return
+        }
+        if (handleDragging) return
+        val geom = computeHandleGeometry(cfg)
+        val view = handleView
+        if (view == null) {
+            createHandle(cfg, geom)
+        } else {
+            updateHandle(cfg, geom, view)
+        }
+    }
+
+    private fun createHandle(cfg: ClickConfig, geom: HandleGeometry) {
+        val view = RegionHandleView(this)
+        view.listener = handleListener
+        view.setMetrics(geom.winW, geom.winH, screenWidth(), screenHeight())
+        view.setRegion(cfg.regionShape, geom.regionW, geom.regionH)
+        val running = runCatching { JidianApp.from(this).engine.isRunning }.getOrDefault(false)
+        val params = newOverlayParams(
+            geom.winW,
+            geom.winH,
+            FLAG_BASE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                (if (running) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
+        )
+        params.x = geom.x
+        params.y = geom.y
+        if (!addWindow(view, params, "handle")) return
+        view.setRunning(running)
+        handleView = view
+        handleParams = params
+        JidianLog.info(TAG, "落点手柄已显示（${geom.regionW}×${geom.regionH} @${geom.cx},${geom.cy}）")
+        if (!handleHintShown) {
+            handleHintShown = true
+            showToast("拖动半透明落点框可定位，长按展开面板")
+        }
+    }
+
+    private fun updateHandle(cfg: ClickConfig, geom: HandleGeometry, view: RegionHandleView) {
+        val params = handleParams ?: return
+        view.setMetrics(geom.winW, geom.winH, screenWidth(), screenHeight())
+        view.setRegion(cfg.regionShape, geom.regionW, geom.regionH)
+        var changed = false
+        if (params.width != geom.winW) {
+            params.width = geom.winW
+            changed = true
+        }
+        if (params.height != geom.winH) {
+            params.height = geom.winH
+            changed = true
+        }
+        if (params.x != geom.x) {
+            params.x = geom.x
+            changed = true
+        }
+        if (params.y != geom.y) {
+            params.y = geom.y
+            changed = true
+        }
+        if (changed) {
+            try {
+                windowManager.updateViewLayout(view, params)
+            } catch (t: Throwable) {
+                JidianLog.warn(TAG, "更新落点手柄失败：${t.message}")
+            }
+        }
+    }
+
+    private fun applyHandleRunning(running: Boolean) {
+        val view = handleView ?: return
+        val params = handleParams ?: return
+        view.setRunning(running)
+        val flags = if (running) {
+            params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        }
+        if (flags == params.flags) return
+        params.flags = flags
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (t: Throwable) {
+            JidianLog.warn(TAG, "切换落点手柄触摸状态失败：${t.message}")
+        }
+    }
+
+    private fun closeHandle() {
+        val view = handleView
+        handleView = null
+        handleParams = null
+        // 转屏 / 服务销毁可能正好打断一次手柄拖动：不清标志的话 refreshHandle 会永远跳过重建
+        handleDragging = false
+        removeWindow(view)
+    }
+
+    private val handleListener = object : RegionHandleView.Listener {
+        override fun onDragBegin() {
+            val view = handleView ?: return
+            val params = handleParams ?: return
+            if (handleDragging) return
+            handleDragging = true
+            val originX = params.x
+            val originY = params.y
+            params.width = WindowManager.LayoutParams.MATCH_PARENT
+            params.height = WindowManager.LayoutParams.MATCH_PARENT
+            params.x = 0
+            params.y = 0
+            try {
+                windowManager.updateViewLayout(view, params)
+            } catch (t: Throwable) {
+                JidianLog.warn(TAG, "进入手柄拖动模式失败：${t.message}")
+            }
+            view.beginDrag(originX, originY)
+        }
+
+        override fun onDragFinished(centerX: Int, centerY: Int) {
+            finishHandleDrag(centerX, centerY)
+        }
+
+        override fun onOpenPanel() {
+            expandPanel()
+        }
+    }
+
+    private fun finishHandleDrag(centerX: Int, centerY: Int) {
+        val view = handleView ?: return
+        val params = handleParams ?: return
+        if (!handleDragging) return
+        handleDragging = false
+        val cfg = currentConfig()
+        val geom = computeHandleGeometry(cfg, centerX, centerY)
+        params.width = geom.winW
+        params.height = geom.winH
+        params.x = geom.x
+        params.y = geom.y
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (t: Throwable) {
+            JidianLog.warn(TAG, "退出手柄拖动模式失败：${t.message}")
+        }
+        view.endDrag()
+        view.setMetrics(geom.winW, geom.winH, screenWidth(), screenHeight())
+        // 写入区域中心 → 引擎下一次点击就用新位置；listener 会再刷新一次几何（幂等）
+        runCatching {
+            JidianApp.from(this).config.update {
+                it.copy(regionCx = geom.cx, regionCy = geom.cy)
+            }
+        }.onFailure { JidianLog.error(TAG, "保存落点手柄位置失败：${it.message}") }
+        JidianLog.info(TAG, "落点手柄移动到 (${geom.cx}, ${geom.cy})")
+    }
+
     // ------------------------------------------------------------------ 框选
 
     private fun enterPicker() {
@@ -470,10 +751,12 @@ class FloatService : Service() {
                 JidianLog.error(TAG, "保存落点失败：${t.message}")
             }
             closePicker()
+            refreshHandle()
         }
 
         override fun onCancel() {
             closePicker()
+            refreshHandle()
             JidianLog.info(TAG, "取消框选")
         }
     }
@@ -505,6 +788,8 @@ class FloatService : Service() {
     }
 
     private fun stopEngineFromNotification() {
+        // 通知栏的停止是用户明确意图，不能被「拖动结束自动恢复」翻回来
+        resumeEngineAfterPodDrag = false
         runCatching { JidianApp.from(this).engine.stop(StopReason.USER) }
             .onFailure { JidianLog.error(TAG, "停止连点失败：${it.message}") }
         JidianLog.info(TAG, "通知栏停止连点")
@@ -639,6 +924,9 @@ class FloatService : Service() {
         /** 圆盘窗口边长（dp）。视觉圆盘比窗口再小一圈，见 ControlPodView。 */
         private const val POD_SIZE_DP = 52f
 
+        /** 落点手柄最小边长（dp），避免用户把区域调太小后手柄抓不住。 */
+        private const val MIN_HANDLE_SIDE_DP = 48f
+
         private const val OVERLAY_PREFS = "jidian_overlay"
         private const val KEY_POD_X = "x"
         private const val KEY_POD_Y = "y"
@@ -650,6 +938,9 @@ class FloatService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        /** 本次进程内只提示一次拖动技巧，避免每次显示悬浮窗都弹 Toast。 */
+        private var handleHintShown = false
 
         /** 显示控制圆盘（先检查悬浮窗权限）。 */
         fun show(context: Context) {

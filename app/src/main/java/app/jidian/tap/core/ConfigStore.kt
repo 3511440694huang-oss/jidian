@@ -76,6 +76,8 @@ class ConfigStore(context: Context) {
             limitCount = prefs.getInt(KEY_LIMIT, d.limitCount),
             pauseOnScreenOff = prefs.getBoolean(KEY_SCREEN_OFF, d.pauseOnScreenOff),
             haptic = prefs.getBoolean(KEY_HAPTIC, d.haptic),
+            batchTaps = prefs.getBoolean(KEY_BATCH, d.batchTaps),
+            showRegionHandle = prefs.getBoolean(KEY_HANDLE, d.showRegionHandle),
         )
         return ClickConfig.sanitized(loaded)
     }
@@ -99,6 +101,8 @@ class ConfigStore(context: Context) {
             .putInt(KEY_LIMIT, c.limitCount)
             .putBoolean(KEY_SCREEN_OFF, c.pauseOnScreenOff)
             .putBoolean(KEY_HAPTIC, c.haptic)
+            .putBoolean(KEY_BATCH, c.batchTaps)
+            .putBoolean(KEY_HANDLE, c.showRegionHandle)
             .apply()
     }
 
@@ -121,5 +125,7 @@ class ConfigStore(context: Context) {
         private const val KEY_LIMIT = "limit_count"
         private const val KEY_SCREEN_OFF = "pause_screen_off"
         private const val KEY_HAPTIC = "haptic"
+        private const val KEY_BATCH = "batch_taps"
+        private const val KEY_HANDLE = "show_region_handle"
     }
 }

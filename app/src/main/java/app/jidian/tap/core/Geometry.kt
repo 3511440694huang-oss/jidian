@@ -108,6 +108,42 @@ object Geometry {
         return Point(p.x.coerceIn(0f, maxX), p.y.coerceIn(0f, maxY))
     }
 
+    /**
+     * 合并连点的批次规划：返回一批点击相对第一个点击的起始时刻（毫秒）。
+     *
+     * AccessibilityService 的 `dispatchGesture` 一次往返要 5–7ms，1ms 间隔下单点命中率
+     * 只有约 150 次/秒；把 N 次点击塞进同一个 GestureDescription 的 N 个 Stroke，可以把
+     * 往返开销摊薄到每次点击上。`getMaxStrokeCount()` 只允许 10 个 Stroke，同时批次的
+     * 总跨度必须够短——用户按停止时不能还残留一长串没放完的点击，所以限制在
+     * [BATCH_MAX_SPAN_MS] 内（1ms 档为 10 次/10ms，20ms 档为 3 次/40ms）。
+     *
+     * 节奏抖动在批次内按 [nextIntervalMs] 逐段累计；某一段会让总跨度超出上限时停止扩批。
+     * 返回值至少一个元素（0 表示不合并）。
+     */
+    fun planBatchStarts(
+        intervalMs: Long,
+        jitterPct: Int,
+        maxStrokes: Int,
+        rng: Random,
+    ): List<Long> {
+        val max = maxStrokes.coerceAtLeast(1)
+        if (max == 1) return listOf(0L)
+        val base = intervalMs.coerceAtLeast(ClickConfig.MIN_INTERVAL_MS)
+        val starts = ArrayList<Long>(max)
+        starts.add(0L)
+        var at = 0L
+        while (starts.size < max) {
+            val step = nextIntervalMs(base, jitterPct, rng)
+            if (at + step > BATCH_MAX_SPAN_MS) break
+            at += step
+            starts.add(at)
+        }
+        return starts
+    }
+
+    /** 合并批次允许的最大总跨度（毫秒）。 */
+    const val BATCH_MAX_SPAN_MS = 48L
+
     /** 滑动终点：起点 + 位移，并收敛到屏幕内（贴边时不会滑出屏幕）。 */
     fun swipeEnd(start: Point, dx: Int, dy: Int, screenW: Int, screenH: Int): Point =
         clampToScreen(Point(start.x + dx, start.y + dy), screenW, screenH)

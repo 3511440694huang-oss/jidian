@@ -62,4 +62,15 @@ class ClickConfigTest {
             assertTrue("抖动后不得小于下限：$next", next >= ClickConfig.MIN_INTERVAL_MS)
         }
     }
+
+    @Test
+    fun batchAndHandleSwitchesSurviveSanitize() {
+        val defaults = ClickConfig.Default.safe()
+        assertTrue(defaults.batchTaps)
+        assertTrue(defaults.showRegionHandle)
+
+        val off = ClickConfig.Default.copy(batchTaps = false, showRegionHandle = false).safe()
+        assertFalse(off.batchTaps)
+        assertFalse(off.showRegionHandle)
+    }
 }

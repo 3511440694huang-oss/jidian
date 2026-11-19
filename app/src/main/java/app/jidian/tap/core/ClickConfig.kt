@@ -34,6 +34,14 @@ data class ClickConfig(
     val limitCount: Int = 0,
     val pauseOnScreenOff: Boolean = true,
     val haptic: Boolean = false,
+    /**
+     * 合并连点：把极限档的多次点击压进**一个** GestureDescription 的多个 Stroke，
+     * 用一次派发开销换多次点击（单次 dispatchGesture 往返约 5–7ms，是 1ms 档跑不快的根因）。
+     * 关掉后回到「一次手势一次点击」，兼容对多点触控敏感的目标。
+     */
+    val batchTaps: Boolean = true,
+    /** 是否在屏幕上显示半透明落点手柄（可直接拖动定位）。 */
+    val showRegionHandle: Boolean = true,
 ) {
     val regionConfigured: Boolean
         get() = regionCx >= 0 && regionCy >= 0
